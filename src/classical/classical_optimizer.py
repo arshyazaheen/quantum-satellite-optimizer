@@ -1,249 +1,391 @@
 """
-Classical Satellite-Target Assignment Optimizer
+Classical exact optimizer for satellite-target assignment problem.
 
-This module formulates and solves the satellite-target assignment problem
-using integer linear programming (ILP) via SciPy's optimization tools
-and OR-Tools as a fallback.
-
-Problem formulation:
-- Decision variables: x[i,j] binary (satellite i observes target j)
-- Objective: Maximize total observation value (priority × feasibility)
-- Constraints:
-  1. Fuel budget per satellite
-  2. Observation capacity per satellite
-  3. Each target observed by at most one satellite (optional)
+Uses brute-force enumeration of all binary combinations to find the optimal
+solution to the constrained maximization problem.
 """
 
-import pandas as pd
+from typing import Dict, List, Tuple, Optional
+import itertools
 import numpy as np
-from typing import Dict, List, Tuple, Any
-from dataclasses import dataclass
-
-
-@dataclass
-class ClassicalSolution:
-    """Result of classical optimization."""
-    assignments: List[Tuple[str, str]]  # [(satellite_id, target_id), ...]
-    objective_value: float
-    total_fuel_used: Dict[str, float]  # {satellite_id: fuel_used}
-    target_coverage: Dict[str, str]  # {target_id: satellite_id or None}
-    constraint_violations: List[str]  # List of constraint violations (empty if feasible)
-    is_feasible: bool
+from src.data.preprocessing import ProblemInstance
 
 
 class ClassicalOptimizer:
     """
-    Classical satellite-target assignment optimizer using ILP.
+    Classical exact optimizer for satellite-target assignment.
     
-    Solves the satellite constellation optimization problem:
-    - Maximize observation value
-    - Subject to fuel budget and capacity constraints
+    Enumerates all possible binary assignments and evaluates feasibility
+    and objective value to find the optimal solution.
     """
     
-    def __init__(
-        self,
-        satellites_df: pd.DataFrame,
-        targets_df: pd.DataFrame,
-        cost_df: pd.DataFrame
-    ):
+    def __init__(self, problem: ProblemInstance):
         """
-        Initialize optimizer with satellite, target, and cost data.
+        Initialize optimizer with a problem instance.
         
-        Parameters:
-        -----------
-        satellites_df : pd.DataFrame
-            Columns: satellite_id, available_fuel, observation_capacity
-        targets_df : pd.DataFrame
-            Columns: target_id, target_priority, observation_feasibility
-        cost_df : pd.DataFrame
-            Columns: satellite_id, target_id, fuel_cost, feasibility
+        Args:
+            problem: ProblemInstance object with satellites, targets, costs, etc.
         """
-        self.satellites_df = satellites_df.copy()
-        self.targets_df = targets_df.copy()
-        self.cost_df = cost_df.copy()
+        self.problem = problem
+        self.variable_names = problem.get_variable_names()
+        self.num_variables = problem.get_num_variables()
+        self.feasible_pairs = problem.get_feasible_pairs()
         
-        self.satellite_ids = satellites_df['satellite_id'].tolist()
-        self.target_ids = targets_df['target_id'].tolist()
+        # Extract objective weights
+        obj_weights = problem.get_objective_weights()
+        self.w_priority = obj_weights['w_priority']
+        self.w_cost = obj_weights['w_cost']
         
-        # Build lookup dictionaries
-        self.satellite_fuel = dict(
-            zip(satellites_df['satellite_id'], satellites_df['available_fuel'])
-        )
-        self.satellite_capacity = dict(
-            zip(satellites_df['satellite_id'], satellites_df['observation_capacity'])
-        )
-        self.target_priority = dict(
-            zip(targets_df['target_id'], targets_df['target_priority'])
-        )
-        self.target_feasibility = dict(
-            zip(targets_df['target_id'], targets_df['observation_feasibility'])
-        )
+        # Store feasible pairs as dict for quick lookup
+        self.pair_index = {pair: idx for idx, pair in enumerate(self.feasible_pairs)}
         
-        # Build cost matrix: cost_matrix[i][j] = (fuel_cost, feasibility) for sat[i] -> tgt[j]
-        self.cost_matrix = {}
-        for _, row in cost_df.iterrows():
-            sat_id = row['satellite_id']
-            tgt_id = row['target_id']
-            self.cost_matrix[(sat_id, tgt_id)] = {
-                'fuel_cost': row['fuel_cost'],
-                'feasibility': row['feasibility']
-            }
+        # Results storage
+        self.optimal_vector = None
+        self.optimal_value = None
+        self.num_feasible = 0
+        self.num_infeasible = 0
+        self.all_evaluations = []
     
-    def _enumerate_feasible_solutions(self) -> List[Dict[str, Any]]:
+    def _get_variable_index(self, sat_id: int, tgt_id: int) -> Optional[int]:
         """
-        Enumerate all feasible solutions by brute-force search.
+        Get index of variable x_ij in the feasible pairs list.
         
-        For small problem sizes (2 satellites, 3 targets = 2^6 = 64 possible assignments),
-        exhaustive enumeration is practical and guarantees global optimum.
+        Args:
+            sat_id: Satellite ID.
+            tgt_id: Target ID.
+            
+        Returns:
+            Index if pair is feasible, None otherwise.
+        """
+        pair = (sat_id, tgt_id)
+        return self.pair_index.get(pair, None)
+    
+    def _vector_to_assignment(self, binary_vector: List[int]) -> Dict[Tuple[int, int], int]:
+        """
+        Convert binary vector to assignment dictionary.
+        
+        Args:
+            binary_vector: List of binary values in feasible pair order.
+            
+        Returns:
+            Dict mapping (sat_id, tgt_id) -> assignment (0 or 1).
+        """
+        assignment = {}
+        for idx, (sat_id, tgt_id) in enumerate(self.feasible_pairs):
+            assignment[(sat_id, tgt_id)] = binary_vector[idx]
+        return assignment
+    
+    def _calculate_objective(self, binary_vector: List[int]) -> float:
+        """
+        Calculate objective value for a binary assignment vector.
+        
+        Objective: Maximize Z = w_p * sum(priority_j * x_ij) - w_c * sum(cost_ij * x_ij)
+        
+        Args:
+            binary_vector: List of binary values for each feasible pair.
+            
+        Returns:
+            Objective value (higher is better).
+        """
+        obj = 0.0
+        
+        for idx, (sat_id, tgt_id) in enumerate(self.feasible_pairs):
+            if binary_vector[idx] == 1:
+                priority = self.problem.get_target_priority(tgt_id)
+                cost = self.problem.get_observation_cost(sat_id, tgt_id)
+                
+                obj += self.w_priority * priority - self.w_cost * cost
+        
+        return obj
+    
+    def _check_target_uniqueness(self, binary_vector: List[int]) -> Tuple[bool, Dict[int, int]]:
+        """
+        Check target assignment uniqueness constraint: each target assigned to at most 1 satellite.
+        
+        Args:
+            binary_vector: List of binary values.
+            
+        Returns:
+            (is_feasible, target_assignment_counts) tuple.
+        """
+        target_counts = {}
+        
+        for idx, (sat_id, tgt_id) in enumerate(self.feasible_pairs):
+            if binary_vector[idx] == 1:
+                if tgt_id not in target_counts:
+                    target_counts[tgt_id] = 0
+                target_counts[tgt_id] += 1
+        
+        # Check: each target has at most 1 assignment
+        for tgt_id in self.problem.get_all_target_ids():
+            count = target_counts.get(tgt_id, 0)
+            if count > 1:
+                return False, target_counts
+        
+        return True, target_counts
+    
+    def _check_satellite_capacity(self, binary_vector: List[int]) -> Tuple[bool, Dict[int, int]]:
+        """
+        Check satellite capacity constraint: each satellite observes at most capacity targets.
+        
+        Args:
+            binary_vector: List of binary values.
+            
+        Returns:
+            (is_feasible, satellite_assignment_counts) tuple.
+        """
+        sat_counts = {}
+        
+        for idx, (sat_id, tgt_id) in enumerate(self.feasible_pairs):
+            if binary_vector[idx] == 1:
+                if sat_id not in sat_counts:
+                    sat_counts[sat_id] = 0
+                sat_counts[sat_id] += 1
+        
+        # Check: each satellite has at most capacity assignments
+        for sat_id in self.problem.get_all_satellite_ids():
+            count = sat_counts.get(sat_id, 0)
+            capacity = self.problem.get_satellite_capacity(sat_id)
+            if count > capacity:
+                return False, sat_counts
+        
+        return True, sat_counts
+    
+    def _check_energy_budget(self, binary_vector: List[int]) -> Tuple[bool, Dict[int, float]]:
+        """
+        Check satellite energy budget constraint.
+        
+        Args:
+            binary_vector: List of binary values.
+            
+        Returns:
+            (is_feasible, satellite_energy_usage) tuple.
+        """
+        sat_energy = {}
+        
+        for idx, (sat_id, tgt_id) in enumerate(self.feasible_pairs):
+            if binary_vector[idx] == 1:
+                cost = self.problem.get_observation_cost(sat_id, tgt_id)
+                if sat_id not in sat_energy:
+                    sat_energy[sat_id] = 0.0
+                sat_energy[sat_id] += cost
+        
+        # Check: each satellite energy usage <= budget
+        for sat_id in self.problem.get_all_satellite_ids():
+            usage = sat_energy.get(sat_id, 0.0)
+            budget = self.problem.get_satellite_energy_budget(sat_id)
+            if usage > budget:
+                return False, sat_energy
+        
+        return True, sat_energy
+    
+    def _is_feasible(self, binary_vector: List[int]) -> Tuple[bool, Dict]:
+        """
+        Check if binary vector satisfies all constraints.
+        
+        Args:
+            binary_vector: List of binary values.
+            
+        Returns:
+            (is_feasible, constraint_info) tuple with detailed constraint status.
+        """
+        constraint_info = {}
+        
+        # Check target uniqueness
+        target_unique, target_counts = self._check_target_uniqueness(binary_vector)
+        constraint_info['target_uniqueness'] = target_unique
+        constraint_info['target_counts'] = target_counts
+        
+        if not target_unique:
+            return False, constraint_info
+        
+        # Check satellite capacity
+        sat_capacity, sat_counts = self._check_satellite_capacity(binary_vector)
+        constraint_info['satellite_capacity'] = sat_capacity
+        constraint_info['satellite_counts'] = sat_counts
+        
+        if not sat_capacity:
+            return False, constraint_info
+        
+        # Check energy budget
+        energy_ok, sat_energy = self._check_energy_budget(binary_vector)
+        constraint_info['energy_budget'] = energy_ok
+        constraint_info['satellite_energy'] = sat_energy
+        
+        if not energy_ok:
+            return False, constraint_info
+        
+        return True, constraint_info
+    
+    def _get_target_coverage(self, binary_vector: List[int]) -> Dict[int, Tuple[int, float]]:
+        """
+        Get target coverage information: which targets are assigned and their priorities.
+        
+        Args:
+            binary_vector: List of binary values.
+            
+        Returns:
+            Dict mapping target_id -> (assigned_satellite_id, priority).
+            Only includes assigned targets.
+        """
+        coverage = {}
+        
+        for idx, (sat_id, tgt_id) in enumerate(self.feasible_pairs):
+            if binary_vector[idx] == 1:
+                priority = self.problem.get_target_priority(tgt_id)
+                coverage[tgt_id] = (sat_id, priority)
+        
+        return coverage
+    
+    def solve(self) -> Dict:
+        """
+        Solve the problem using brute-force enumeration.
         
         Returns:
-        --------
-        List[Dict] : List of feasible solutions, each containing:
-            - 'assignments': list of (sat_id, tgt_id) tuples
-            - 'objective_value': total observation value
-            - 'fuel_used': dict of {sat_id: fuel_used}
-            - 'target_coverage': dict of {tgt_id: sat_id or None}
+            Dict with keys:
+                - 'optimal_vector': best binary vector found
+                - 'objective_value': objective value at optimum
+                - 'variable_names': list of variable names
+                - 'assignments': dict of (sat_id, tgt_id) -> value for assigned pairs
+                - 'feasible': boolean, whether optimal is feasible
+                - 'num_feasible': count of feasible solutions evaluated
+                - 'num_infeasible': count of infeasible solutions rejected
+                - 'target_coverage': dict of assigned targets and priorities
+                - 'total_priority_covered': sum of priorities of assigned targets
+                - 'satellite_energy_usage': dict of sat_id -> energy usage
+                - 'satellite_capacity_usage': dict of sat_id -> (num_targets, capacity)
+                - 'constraint_info': detailed constraint status at optimum
         """
-        n_satellites = len(self.satellite_ids)
-        n_targets = len(self.target_ids)
-        n_vars = n_satellites * n_targets
+        best_vector = None
+        best_obj = -np.inf
+        best_feasible = False
+        best_constraint_info = None
         
-        feasible_solutions = []
-        
-        # Iterate over all 2^n possible assignments
-        for assignment_bits in range(2 ** n_vars):
-            # Decode bits into assignment matrix x[i,j]
-            x = {}
-            bit_index = 0
-            for sat_idx, sat_id in enumerate(self.satellite_ids):
-                for tgt_idx, tgt_id in enumerate(self.target_ids):
-                    x[(sat_id, tgt_id)] = (assignment_bits >> bit_index) & 1
-                    bit_index += 1
+        # Enumerate all 2^num_variables binary combinations
+        for binary_tuple in itertools.product([0, 1], repeat=self.num_variables):
+            binary_vector = list(binary_tuple)
             
-            # Check feasibility of this assignment
-            violations = []
-            fuel_used = {sat_id: 0.0 for sat_id in self.satellite_ids}
-            target_coverage = {tgt_id: None for tgt_id in self.target_ids}
+            # Check feasibility
+            is_feasible, constraint_info = self._is_feasible(binary_vector)
             
-            # Constraint 1: Fuel budget per satellite
-            for sat_id in self.satellite_ids:
-                fuel = 0.0
-                for tgt_id in self.target_ids:
-                    if x[(sat_id, tgt_id)] == 1:
-                        fuel += self.cost_matrix[(sat_id, tgt_id)]['fuel_cost']
-                fuel_used[sat_id] = fuel
+            if is_feasible:
+                self.num_feasible += 1
+                obj_value = self._calculate_objective(binary_vector)
                 
-                if fuel > self.satellite_fuel[sat_id]:
-                    violations.append(
-                        f"Satellite {sat_id} fuel exceeded: {fuel} > {self.satellite_fuel[sat_id]}"
-                    )
-            
-            # Constraint 2: Observation capacity per satellite
-            for sat_id in self.satellite_ids:
-                n_targets_observed = sum(
-                    x[(sat_id, tgt_id)] for tgt_id in self.target_ids
-                )
-                if n_targets_observed > self.satellite_capacity[sat_id]:
-                    violations.append(
-                        f"Satellite {sat_id} capacity exceeded: {n_targets_observed} > {self.satellite_capacity[sat_id]}"
-                    )
-            
-            # Constraint 3: Each target observed by at most one satellite
-            for tgt_id in self.target_ids:
-                n_satellites_observing = sum(
-                    x[(sat_id, tgt_id)] for sat_id in self.satellite_ids
-                )
-                if n_satellites_observing > 1:
-                    violations.append(
-                        f"Target {tgt_id} observed by multiple satellites: {n_satellites_observing}"
-                    )
-                elif n_satellites_observing == 1:
-                    # Find which satellite
-                    for sat_id in self.satellite_ids:
-                        if x[(sat_id, tgt_id)] == 1:
-                            target_coverage[tgt_id] = sat_id
-            
-            # If feasible, compute objective value
-            if not violations:
-                objective_value = 0.0
-                assignments = []
-                for sat_id in self.satellite_ids:
-                    for tgt_id in self.target_ids:
-                        if x[(sat_id, tgt_id)] == 1:
-                            # Objective: priority × feasibility
-                            value = (
-                                self.target_priority[tgt_id] *
-                                self.cost_matrix[(sat_id, tgt_id)]['feasibility']
-                            )
-                            objective_value += value
-                            assignments.append((sat_id, tgt_id))
+                # Store for debugging
+                self.all_evaluations.append({
+                    'vector': binary_vector,
+                    'objective': obj_value,
+                    'feasible': True
+                })
                 
-                feasible_solutions.append({
-                    'assignments': assignments,
-                    'objective_value': objective_value,
-                    'fuel_used': fuel_used.copy(),
-                    'target_coverage': target_coverage.copy()
+                # Update best if this is better
+                if obj_value > best_obj:
+                    best_obj = obj_value
+                    best_vector = binary_vector
+                    best_feasible = True
+                    best_constraint_info = constraint_info
+            else:
+                self.num_infeasible += 1
+                self.all_evaluations.append({
+                    'vector': binary_vector,
+                    'objective': None,
+                    'feasible': False,
+                    'constraint_info': constraint_info
                 })
         
-        return feasible_solutions
+        self.optimal_vector = best_vector
+        self.optimal_value = best_obj
+        
+        # Build result dictionary
+        result = {
+            'optimal_vector': best_vector,
+            'objective_value': best_obj if best_feasible else None,
+            'variable_names': self.variable_names,
+            'feasible': best_feasible,
+            'num_feasible': self.num_feasible,
+            'num_infeasible': self.num_infeasible,
+        }
+        
+        if best_feasible:
+            # Add detailed assignment information
+            assignment = self._vector_to_assignment(best_vector)
+            result['assignments'] = {pair: val for pair, val in assignment.items() if val == 1}
+            
+            # Add target coverage
+            coverage = self._get_target_coverage(best_vector)
+            result['target_coverage'] = coverage
+            total_priority = sum(priority for _, priority in coverage.values())
+            result['total_priority_covered'] = total_priority
+            
+            # Add energy and capacity usage
+            result['satellite_energy_usage'] = best_constraint_info.get('satellite_energy', {})
+            result['satellite_capacity_usage'] = {}
+            for sat_id in self.problem.get_all_satellite_ids():
+                num_assigned = best_constraint_info.get('satellite_counts', {}).get(sat_id, 0)
+                capacity = self.problem.get_satellite_capacity(sat_id)
+                result['satellite_capacity_usage'][sat_id] = (num_assigned, capacity)
+            
+            result['constraint_info'] = best_constraint_info
+        
+        return result
     
-    def solve(self) -> ClassicalSolution:
+    def get_summary(self, result: Dict) -> str:
         """
-        Solve the satellite-target assignment problem.
+        Get a human-readable summary of the optimization result.
         
-        For the small 2×3 problem, uses exhaustive enumeration.
-        Finds the feasible solution with maximum objective value.
-        
+        Args:
+            result: Result dictionary from solve().
+            
         Returns:
-        --------
-        ClassicalSolution : Solution object with assignments, objective value, and metadata.
+            Formatted summary string.
         """
-        feasible_solutions = self._enumerate_feasible_solutions()
+        lines = []
+        lines.append("=" * 70)
+        lines.append("CLASSICAL OPTIMIZER RESULT")
+        lines.append("=" * 70)
         
-        if not feasible_solutions:
-            # No feasible solution exists; return empty result
-            return ClassicalSolution(
-                assignments=[],
-                objective_value=0.0,
-                total_fuel_used={sat_id: 0.0 for sat_id in self.satellite_ids},
-                target_coverage={tgt_id: None for tgt_id in self.target_ids},
-                constraint_violations=["No feasible solution exists"],
-                is_feasible=False
-            )
+        lines.append(f"\nProblem: {self.problem.get_problem_name()}")
+        lines.append(f"Satellites: {self.problem.get_num_satellites()}")
+        lines.append(f"Targets: {self.problem.get_num_targets()}")
+        lines.append(f"Feasible variables: {self.num_variables}")
         
-        # Find solution with maximum objective value
-        best_solution = max(feasible_solutions, key=lambda s: s['objective_value'])
+        lines.append(f"\nSolution feasibility: {'FEASIBLE' if result['feasible'] else 'INFEASIBLE'}")
+        lines.append(f"Objective value: {result['objective_value']}")
+        lines.append(f"Optimal vector: {result['optimal_vector']}")
+        lines.append(f"Variable names: {result['variable_names']}")
         
-        return ClassicalSolution(
-            assignments=best_solution['assignments'],
-            objective_value=best_solution['objective_value'],
-            total_fuel_used=best_solution['fuel_used'],
-            target_coverage=best_solution['target_coverage'],
-            constraint_violations=[],
-            is_feasible=True
-        )
-
-
-def load_and_solve(
-    satellites_path: str,
-    targets_path: str,
-    cost_path: str
-) -> ClassicalSolution:
-    """
-    Convenience function: load data files and solve.
-    
-    Parameters:
-    -----------
-    satellites_path, targets_path, cost_path : str
-        Paths to CSV data files.
-    
-    Returns:
-    --------
-    ClassicalSolution : Optimization result.
-    """
-    satellites_df = pd.read_csv(satellites_path)
-    targets_df = pd.read_csv(targets_path)
-    cost_df = pd.read_csv(cost_path)
-    
-    optimizer = ClassicalOptimizer(satellites_df, targets_df, cost_df)
-    return optimizer.solve()
+        if result['feasible']:
+            lines.append(f"\nAssignments:")
+            for (sat_id, tgt_id), val in result['assignments'].items():
+                if val == 1:
+                    sat_name = self.problem.get_satellite(sat_id)['name']
+                    tgt_name = self.problem.get_target(tgt_id)['name']
+                    lines.append(f"  {sat_name} → {tgt_name}")
+            
+            lines.append(f"\nTarget coverage:")
+            for tgt_id, (sat_id, priority) in result['target_coverage'].items():
+                sat_name = self.problem.get_satellite(sat_id)['name']
+                tgt_name = self.problem.get_target(tgt_id)['name']
+                lines.append(f"  {tgt_name} (priority={priority}) ← {sat_name}")
+            lines.append(f"  Total priority covered: {result['total_priority_covered']}")
+            
+            lines.append(f"\nEnergy usage:")
+            for sat_id, energy in result['satellite_energy_usage'].items():
+                budget = self.problem.get_satellite_energy_budget(sat_id)
+                sat_name = self.problem.get_satellite(sat_id)['name']
+                lines.append(f"  {sat_name}: {energy:.1f} / {budget} units")
+            
+            lines.append(f"\nCapacity usage:")
+            for sat_id, (num_assigned, capacity) in result['satellite_capacity_usage'].items():
+                sat_name = self.problem.get_satellite(sat_id)['name']
+                lines.append(f"  {sat_name}: {num_assigned} / {capacity} targets")
+        
+        lines.append(f"\nSearch statistics:")
+        lines.append(f"  Feasible solutions: {result['num_feasible']}")
+        lines.append(f"  Infeasible solutions: {result['num_infeasible']}")
+        lines.append(f"  Total combinations evaluated: {result['num_feasible'] + result['num_infeasible']}")
+        
+        lines.append("=" * 70)
+        
+        return "\n".join(lines)
