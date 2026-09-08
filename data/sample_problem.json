@@ -1,0 +1,84 @@
+{
+  "problem_name": "Quantum Satellite Optimizer - Toy Instance",
+  "description": "2 satellites, 3 targets - toy instance for QAOA demonstration",
+  "metadata": {
+    "num_satellites": 2,
+    "num_targets": 3,
+    "objective_weights": {
+      "w_priority": 1.0,
+      "w_cost": 0.5
+    },
+    "penalty_weights": {
+      "lambda1": 100,
+      "lambda2": 100
+    },
+    "notes": "All numerical values are illustrative assumptions, not from UC-096"
+  },
+  "satellites": [
+    {
+      "id": 1,
+      "name": "SAT-1",
+      "type": "Optical",
+      "capacity": 2,
+      "energy_budget": 100,
+      "description": "Optical sensor satellite with capacity for 2 targets"
+    },
+    {
+      "id": 2,
+      "name": "SAT-2",
+      "type": "SAR",
+      "capacity": 1,
+      "energy_budget": 80,
+      "description": "Synthetic Aperture Radar satellite with capacity for 1 target"
+    }
+  ],
+  "targets": [
+    {
+      "id": 1,
+      "name": "T1",
+      "priority": 10,
+      "description": "Urban area, observable by Optical and SAR",
+      "compatible_sensors": ["Optical", "SAR"]
+    },
+    {
+      "id": 2,
+      "name": "T2",
+      "priority": 8,
+      "description": "Agricultural region, observable by Optical only",
+      "compatible_sensors": ["Optical"]
+    },
+    {
+      "id": 3,
+      "name": "T3",
+      "priority": 12,
+      "description": "Disaster zone, observable by SAR only",
+      "compatible_sensors": ["SAR"]
+    }
+  ],
+  "observation_costs": [
+    {
+      "satellite_id": 1,
+      "target_id": 1,
+      "cost": 15,
+      "units": "energy"
+    },
+    {
+      "satellite_id": 1,
+      "target_id": 2,
+      "cost": 12,
+      "units": "energy"
+    },
+    {
+      "satellite_id": 2,
+      "target_id": 1,
+      "cost": 20,
+      "units": "energy"
+    },
+    {
+      "satellite_id": 2,
+      "target_id": 3,
+      "cost": 25,
+      "units": "energy"
+    }
+  ]
+}
