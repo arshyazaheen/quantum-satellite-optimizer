@@ -111,9 +111,11 @@ class ProblemInstance:
         """
         Identify feasible satellite-target pairs based on sensor compatibility.
         
-        A pair (satellite_id, target_id) is feasible if:
+        A pair (satellite_id, target_id) is feasible if and only if:
         1. The satellite's sensor type is in the target's compatible_sensors list.
-        2. The pair has an observation cost entry.
+        2. An observation cost entry exists for this pair.
+        
+        Both conditions must be true for a pair to be feasible.
         """
         self.feasible_pairs = []  # List of (sat_id, tgt_id) tuples
         
@@ -125,7 +127,9 @@ class ProblemInstance:
                 tgt_id = tgt['id']
                 compatible_sensors = tgt['compatible_sensors']
                 
-                # Check compatibility
+                # Check both conditions:
+                # 1. Sensor type compatibility
+                # 2. Cost exists for this pair
                 if sat_type in compatible_sensors and (sat_id, tgt_id) in self.cost_matrix:
                     self.feasible_pairs.append((sat_id, tgt_id))
         
@@ -230,16 +234,32 @@ class ProblemInstance:
     
     def is_compatible(self, sat_id: int, tgt_id: int) -> bool:
         """
-        Check if a satellite can observe a target (sensor compatibility).
+        Check if a satellite can observe a target (sensor compatibility and cost exists).
+        
+        A pair is compatible if and only if:
+        1. The satellite's sensor type is in the target's compatible_sensors list.
+        2. An observation cost exists for this pair.
         
         Args:
             sat_id: Satellite ID.
             tgt_id: Target ID.
             
         Returns:
-            True if compatible and cost exists, False otherwise.
+            True if both conditions are met, False otherwise.
         """
-        return (sat_id, tgt_id) in self.cost_matrix
+        # Condition 1: Cost must exist
+        if (sat_id, tgt_id) not in self.cost_matrix:
+            return False
+        
+        # Condition 2: Sensor type must be compatible
+        try:
+            satellite = self.get_satellite(sat_id)
+            target = self.get_target(tgt_id)
+            sat_type = satellite['type']
+            compatible_sensors = target['compatible_sensors']
+            return sat_type in compatible_sensors
+        except KeyError:
+            return False
     
     def get_satellite_capacity(self, sat_id: int) -> int:
         """
