@@ -1,0 +1,7 @@
+satellite_id,target_id,fuel_cost,feasibility
+SAT_001,TGT_001,25,0.98
+SAT_001,TGT_002,30,0.85
+SAT_001,TGT_003,35,0.90
+SAT_002,TGT_001,40,0.80
+SAT_002,TGT_002,20,0.95
+SAT_002,TGT_003,45,0.75
